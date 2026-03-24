@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DKLs23 WASM demo (DKG + DSG 3-of-5)</title>
+</head>
+<body>
+  <h1>DKLs23 WASM demo (DKG + DSG 3-of-5)</h1>
+  <p id="status">Loading...</p>
+  <pre id="output"></pre>
+  <button id="run-btn">Run DKG+DSG (3-of-5)</button>
+
+  <script type="module">
+    // Import the wasm-pack output for the wasm-runner example (pkg in the same folder)
+    import init, * as wasm from './pkg/wasm_runner.js';
+
+    const status = document.getElementById('status');
+    const out = document.getElementById('output');
+    const btn = document.getElementById('run-btn');
+
+    async function run_demo() {
+      try {
+        await init();
+        status.textContent = 'WASM initialized';
+
+        if (wasm.run_dkg_dsg_t3_n5) {
+          // wasm.run_dkg_dsg_t3_n5 returns a JSON string
+          const res = wasm.run_dkg_dsg_t3_n5();
+          out.textContent = res;
+        } else {
+          out.textContent = 'run_dkg_dsg_t3_n5 not exported. Ensure wasm-demo built.';
+        }
+      } catch (e) {
+        status.textContent = 'Error initializing or running WASM';
+        out.textContent = e.toString();
+        console.error(e);
+      }
+    }
+
+    btn.addEventListener('click', run_demo);
+  </script>
+</body>
+</html>

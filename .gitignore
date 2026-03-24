@@ -2,3 +2,4 @@
 # coder workflow artifacts
 .gemini/
 .coder/
+*.md

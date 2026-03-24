@@ -3,5 +3,6 @@ members = [
     "dkls23-core",
     "dkls23-secp256k1",
     "dkls23-secp256r1",
+    "examples/wasm-demo/wasm-runner",
 ]
 resolver = "2"
