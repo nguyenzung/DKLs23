@@ -69,7 +69,7 @@ fn e2e_dkg_using_phaseio() {
 
     // Phase1: polynomials (raw scalars) — handled directly (not framed)
     let mut dkg_1: Vec<Vec<k256::Scalar>> = Vec::with_capacity(n);
-    for s in &sessions { dkg_1.push(s.phase1()); }
+    for s in sessions.iter_mut() { dkg_1.push(s.phase1().unwrap()); }
 
     // transpose
     let mut poly_fragments = vec![Vec::<k256::Scalar>::with_capacity(n); n];

@@ -54,6 +54,7 @@ use rustcrypto_group::prime::PrimeCurveAffine;
 use rustcrypto_group::Curve as GroupCurve;
 
 use rand::RngExt;
+use zeroize::Zeroize;
 
 use crate::curve::DklsCurve;
 use crate::protocols::derivation::{ChainCode, DerivData, CHAIN_CODE_LEN};
@@ -90,12 +91,50 @@ pub struct ProofCommitment<C: DklsCurve> {
 }
 
 /// Data needed to start key generation and is used during the phases.
+///
+/// For a regular DKG, set `is_reshare = false` and leave all `old_*` fields as `None`.
+/// For resharing, set `is_reshare = true` and populate the relevant fields.
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct SessionData {
+#[cfg_attr(
+    feature = "serde",
+    serde(bound(
+        serialize = "C::AffinePoint: serde::Serialize, C::Scalar: serde::Serialize",
+        deserialize = "C::AffinePoint: serde::Deserialize<'de>, C::Scalar: serde::Deserialize<'de>"
+    ))
+)]
+pub struct SessionData<C: DklsCurve> {
     pub parameters: Parameters,
     pub party_index: PartyIndex,
     pub session_id: Vec<u8>,
+
+    // Resharing context — all `None` / `false` for a regular DKG.
+    /// True when this session is a resharing run (not a fresh DKG).
+    pub is_reshare: bool,
+    /// Minimum parties from the old set needed for Lagrange interpolation.
+    pub old_threshold: Option<u8>,
+    /// The subset J of old parties participating in this resharing run.
+    pub old_participants: Option<Vec<PartyIndex>>,
+    /// Old group public key — kept until Phase 4 to verify `new_pk == old_pk`.
+    pub old_pk: Option<C::AffinePoint>,
+    /// This party's old secret share `s_i`. Must NEVER be serialised.
+    /// It is zeroised immediately after Phase 1 has used it.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub old_share: Option<C::Scalar>,
+}
+
+impl<C: DklsCurve> Zeroize for SessionData<C>
+where
+    C::Scalar: Zeroize,
+{
+    fn zeroize(&mut self) {
+        self.session_id.zeroize();
+        if let Some(ref mut s) = self.old_share {
+            s.zeroize();
+        }
+        self.old_share = None;
+        // old_pk and old_participants are public values — not zeroized.
+    }
 }
 
 // INITIALIZING ZERO SHARES PROTOCOL.
@@ -438,26 +477,102 @@ pub(crate) fn step5<C: DklsCurve>(
 
 // PHASES
 
+/// Computes the Lagrange coefficient λ_i for `party_index` within `participants` at point 0.
+///
+/// Formula: λ_i = Π_{k ∈ participants, k ≠ i} k / (k − i)
+/// where k and i are scalars derived from `party_index.as_u8()`.
+///
+/// # Errors
+///
+/// Returns `Err` if the denominator is zero (only when two parties share the same index).
+pub(crate) fn calculate_lagrange_coefficient<C: DklsCurve>(
+    party_index: PartyIndex,
+    participants: &[PartyIndex],
+) -> Result<C::Scalar, Abort> {
+    let i = C::Scalar::from(u64::from(party_index.as_u8()));
+    let mut numerator = <C::Scalar as Field>::ONE;
+    let mut denominator = <C::Scalar as Field>::ONE;
+
+    for &k in participants {
+        if k == party_index {
+            continue;
+        }
+        let k_s = C::Scalar::from(u64::from(k.as_u8()));
+        numerator *= k_s;
+        denominator *= k_s - i;
+    }
+
+    // `invert()` returns None only when denominator == 0,
+    // which can only happen if two parties share the same index.
+    Option::<C::Scalar>::from(denominator.invert())
+        .map(|inv| numerator * inv)
+        .ok_or_else(|| Abort::recoverable(party_index, AbortReason::ZeroDenominator))
+}
+
 /// Phase 1 = [`step1`] and [`step2`].
 ///
 /// # Input
 ///
-/// Parameters for the key generation.
+/// Session data for the key generation or resharing.
 ///
 /// # Output
 ///
-/// Evaluation of a random polynomial at every party index.
-/// The j-th coordinate of the output vector must be sent
-/// to the party with index j.
+/// Evaluation of a polynomial at every party index.
+/// The j-th coordinate of the output vector must be sent to the party with index j.
 ///
 /// ATTENTION: In particular, we keep the coordinate corresponding
 /// to our party index for the next phase.
-#[must_use]
-pub(crate) fn phase1<C: DklsCurve>(data: &SessionData) -> Vec<C::Scalar> {
-    // DKG
-    let secret_polynomial = step1::<C>(&data.parameters);
+///
+/// # Errors
+///
+/// Returns `Err` when `is_reshare` is true and:
+/// - This party belongs to `old_participants` but `old_share` is `None`.
+/// - `|old_participants| < old_threshold`.
+pub(crate) fn phase1<C: DklsCurve>(data: &SessionData<C>) -> Result<Vec<C::Scalar>, Abort> {
+    if !data.is_reshare {
+        // Regular DKG: fully random polynomial.
+        let secret_polynomial = step1::<C>(&data.parameters);
+        return Ok(step2::<C>(&data.parameters, &secret_polynomial));
+    }
 
-    step2::<C>(&data.parameters, &secret_polynomial)
+    // ── Resharing path ──────────────────────────────────────────────────────
+    let participants = data.old_participants.as_deref().unwrap_or(&[]);
+    let old_threshold = data.old_threshold.unwrap_or(0) as usize;
+
+    // Validate: need at least old_threshold parties in J for Lagrange interpolation.
+    if participants.len() < old_threshold {
+        return Err(Abort::recoverable(
+            data.party_index,
+            AbortReason::WrongCounterpartyCount {
+                expected: old_threshold,
+                got: participants.len(),
+            },
+        ));
+    }
+
+    // Compute the constant term a_{i,0}.
+    let constant_term = if participants.contains(&data.party_index) {
+        // This party belongs to J and must have an old share.
+        // Falling back to zero would silently corrupt the reconstructed secret —
+        // we abort instead.
+        let s_i = data.old_share.ok_or_else(|| {
+            Abort::recoverable(data.party_index, AbortReason::TrivialKeyShare)
+        })?;
+        let lambda = calculate_lagrange_coefficient::<C>(data.party_index, participants)?;
+        lambda * s_i
+    } else {
+        // New or non-J party: a_{i,0} MUST be zero to preserve the group secret.
+        <C::Scalar as Field>::ZERO
+    };
+
+    // Build polynomial: constant_term at [0], random coefficients for [1..threshold).
+    let mut polynomial: Vec<C::Scalar> = Vec::with_capacity(data.parameters.threshold as usize);
+    polynomial.push(constant_term);
+    for _ in 1..data.parameters.threshold {
+        polynomial.push(<C::Scalar as Field>::random(&mut rng::get_rng()));
+    }
+
+    Ok(step2::<C>(&data.parameters, &polynomial))
 }
 
 // Communication round 1
@@ -482,7 +597,7 @@ pub(crate) fn phase1<C: DklsCurve>(data: &SessionData) -> Vec<C::Scalar> {
 /// conventions [here](self).
 #[must_use]
 pub(crate) fn phase2<C: DklsCurve>(
-    data: &SessionData,
+    data: &SessionData<C>,
     poly_fragments: &[C::Scalar],
 ) -> (
     C::Scalar,
@@ -568,7 +683,7 @@ pub(crate) fn phase2<C: DklsCurve>(
 #[must_use]
 #[allow(clippy::type_complexity)]
 pub(crate) fn phase3<C: DklsCurve>(
-    data: &SessionData,
+    data: &SessionData<C>,
     zero_kept: &BTreeMap<PartyIndex, KeepInitZeroSharePhase2to3>,
     bip_kept: &UniqueKeepDerivationPhase2to3,
 ) -> (
@@ -736,7 +851,7 @@ pub(crate) fn phase3<C: DklsCurve>(
 /// with the party indices in the received vectors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn phase4<C: DklsCurve>(
-    data: &SessionData,
+    data: &SessionData<C>,
     poly_point: &C::Scalar,
     proofs_commitments: &[ProofCommitment<C>],
     zero_kept: &BTreeMap<PartyIndex, KeepInitZeroSharePhase3to4>,
@@ -1136,7 +1251,7 @@ mod tests {
     }
 
     struct DkgPhase4Inputs {
-        all_data: Vec<SessionData>,
+        all_data: Vec<SessionData<TestCurve>>,
         poly_points: Vec<Scalar>,
         proofs_commitments: Vec<ProofCommitment<TestCurve>>,
         zero_kept_3to4: Vec<BTreeMap<PartyIndex, KeepInitZeroSharePhase3to4>>,
@@ -1157,19 +1272,25 @@ mod tests {
         let session_id = rng::get_rng().random::<[u8; SESSION_ID_LEN]>();
 
         // Each party prepares their data for this DKG.
-        let mut all_data: Vec<SessionData> = Vec::with_capacity(parameters.share_count as usize);
+        let mut all_data: Vec<SessionData<TestCurve>> =
+            Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
             all_data.push(SessionData {
                 parameters: parameters.clone(),
                 party_index: PartyIndex::new(i + 1).unwrap(),
                 session_id: session_id.to_vec(),
+                is_reshare: false,
+                old_threshold: None,
+                old_participants: None,
+                old_pk: None,
+                old_share: None,
             });
         }
 
         // Phase 1
         let mut dkg_1: Vec<Vec<Scalar>> = Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
-            let out1 = phase1::<TestCurve>(&all_data[i as usize]);
+            let out1 = phase1::<TestCurve>(&all_data[i as usize]).unwrap();
             dkg_1.push(out1);
         }
 
@@ -1679,19 +1800,25 @@ mod tests {
         let session_id = rng::get_rng().random::<[u8; SESSION_ID_LEN]>();
 
         // Each party prepares their data for this DKG.
-        let mut all_data: Vec<SessionData> = Vec::with_capacity(parameters.share_count as usize);
+        let mut all_data: Vec<SessionData<TestCurve>> =
+            Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
             all_data.push(SessionData {
                 parameters: parameters.clone(),
                 party_index: PartyIndex::new(i + 1).unwrap(),
                 session_id: session_id.to_vec(),
+                is_reshare: false,
+                old_threshold: None,
+                old_participants: None,
+                old_pk: None,
+                old_share: None,
             });
         }
 
         // Phase 1
         let mut dkg_1: Vec<Vec<Scalar>> = Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
-            let out1 = phase1::<TestCurve>(&all_data[i as usize]);
+            let out1 = phase1::<TestCurve>(&all_data[i as usize]).unwrap();
 
             dkg_1.push(out1);
         }
