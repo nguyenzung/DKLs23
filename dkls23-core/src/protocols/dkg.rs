@@ -542,54 +542,45 @@ pub(crate) fn calculate_lagrange_coefficient<C: DklsCurve>(
 /// - This party belongs to `old_participants` but `old_share` is `None`.
 /// - `|old_participants| < old_threshold`.
 pub(crate) fn phase1<C: DklsCurve>(data: &SessionData<C>) -> Result<Vec<C::Scalar>, Abort> {
-    if !data.is_reshare {
+    let mut secret_polynomial = step1::<C>(&data.parameters);
+    if data.is_reshare {
         // Regular DKG: fully random polynomial.
-        let secret_polynomial = step1::<C>(&data.parameters);
-        return Ok(step2::<C>(&data.parameters, &secret_polynomial));
+        // ── Resharing path ──────────────────────────────────────────────────────
+        let participants = data.old_participants.as_deref().unwrap_or(&[]);
+        let old_threshold = data.old_threshold.unwrap_or(0) as usize;
+
+        // Validate: need at least old_threshold parties in J for Lagrange interpolation.
+        if participants.len() < old_threshold {
+            return Err(Abort::recoverable(
+                data.party_index,
+                AbortReason::WrongCounterpartyCount {
+                    expected: old_threshold,
+                    got: participants.len(),
+                },
+            ));
+        }
+
+        // Use `old_party_index` when set (old party with a different new index).
+        let effective_index = data.old_party_index.unwrap_or(data.party_index);
+
+        // Compute the constant term a_{i,0}.
+        let constant_term = if participants.contains(&effective_index) {
+            // This party belongs to J and must have an old share.
+            // Falling back to zero would silently corrupt the reconstructed secret —
+            // we abort instead.
+            let s_i = data.old_share.ok_or_else(|| {
+                Abort::recoverable(data.party_index, AbortReason::TrivialKeyShare)
+            })?;
+            let lambda = calculate_lagrange_coefficient::<C>(effective_index, participants)?;
+            lambda * s_i
+        } else {
+            // New or non-J party: a_{i,0} MUST be zero to preserve the group secret.
+            <C::Scalar as Field>::ZERO
+        };
+        secret_polynomial[0] = constant_term;
     }
 
-    // ── Resharing path ──────────────────────────────────────────────────────
-    let participants = data.old_participants.as_deref().unwrap_or(&[]);
-    let old_threshold = data.old_threshold.unwrap_or(0) as usize;
-
-    // Validate: need at least old_threshold parties in J for Lagrange interpolation.
-    if participants.len() < old_threshold {
-        return Err(Abort::recoverable(
-            data.party_index,
-            AbortReason::WrongCounterpartyCount {
-                expected: old_threshold,
-                got: participants.len(),
-            },
-        ));
-    }
-
-    // Fix A: Use `old_party_index` when set (old party with a different new index).
-    // e.g. old index = 2, new index = 3 → must look up old index 2 in `participants`.
-    let effective_index = data.old_party_index.unwrap_or(data.party_index);
-
-    // Compute the constant term a_{i,0}.
-    let constant_term = if participants.contains(&effective_index) {
-        // This party belongs to J and must have an old share.
-        // Falling back to zero would silently corrupt the reconstructed secret —
-        // we abort instead.
-        let s_i = data.old_share.ok_or_else(|| {
-            Abort::recoverable(data.party_index, AbortReason::TrivialKeyShare)
-        })?;
-        let lambda = calculate_lagrange_coefficient::<C>(effective_index, participants)?;
-        lambda * s_i
-    } else {
-        // New or non-J party: a_{i,0} MUST be zero to preserve the group secret.
-        <C::Scalar as Field>::ZERO
-    };
-
-    // Build polynomial: constant_term at [0], random coefficients for [1..threshold).
-    let mut polynomial: Vec<C::Scalar> = Vec::with_capacity(data.parameters.threshold as usize);
-    polynomial.push(constant_term);
-    for _ in 1..data.parameters.threshold {
-        polynomial.push(<C::Scalar as Field>::random(&mut rng::get_rng()));
-    }
-
-    Ok(step2::<C>(&data.parameters, &polynomial))
+    Ok(step2::<C>(&data.parameters, &secret_polynomial))
 }
 
 // Communication round 1

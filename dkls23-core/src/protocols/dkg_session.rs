@@ -760,12 +760,15 @@ mod tests {
     #[test]
     fn test_resharing_chain() {
         // ── Step 0: initial DKG 2-of-2 ──────────────────────────────────────
-        let params_2of2 = Parameters { threshold: 2, share_count: 2 };
+        let params_2of2 = Parameters {
+            threshold: 2,
+            share_count: 2,
+        };
         let sid0: [u8; 32] = rng::get_rng().random();
         let initial = run_full_dkg(params_2of2.clone(), &sid0);
         let pk = initial[0].pk; // the public key that must survive every resharing
-        // The chain code is the same for all parties after DKG (Fix B ensures it stays the same
-        // through resharing). We'll reuse it when constructing new-party sessions.
+                                // The chain code is the same for all parties after DKG (Fix B ensures it stays the same
+                                // through resharing). We'll reuse it when constructing new-party sessions.
         let chain_code = initial[0].derivation_data.chain_code;
         assert_eq!(initial[1].pk, pk);
 
@@ -773,7 +776,10 @@ mod tests {
         // Strategy: use a temporary share_count=3 configuration so every party
         // gets a distinct new index.  P1 → new idx 1, P3 (new) → new idx 2,
         // P2 (dropped) → new idx 3 (dummy slot, result discarded afterwards).
-        let params_2of3_tmp = Parameters { threshold: 2, share_count: 3 };
+        let params_2of3_tmp = Parameters {
+            threshold: 2,
+            share_count: 3,
+        };
         let sid1: [u8; 32] = rng::get_rng().random();
         let j1 = vec![PartyIndex::new(1).unwrap(), PartyIndex::new(2).unwrap()];
 
@@ -813,7 +819,10 @@ mod tests {
 
         // ── Step 2: 2-of-3 (active: {P1,P3}) → 3-of-3, add P4 (thêm party) ──
         // J = {P1 at idx 1, P3 at idx 2}; old_threshold = 2 (from 2-of-3 config).
-        let params_3of3 = Parameters { threshold: 3, share_count: 3 };
+        let params_3of3 = Parameters {
+            threshold: 3,
+            share_count: 3,
+        };
         let sid2: [u8; 32] = rng::get_rng().random();
         let j2 = vec![PartyIndex::new(1).unwrap(), PartyIndex::new(2).unwrap()];
 
@@ -851,7 +860,10 @@ mod tests {
 
         // ── Step 3: 3-of-3 → 3-of-4, add P5 (thêm party) ───────────────────
         // J = {1, 2, 3} (all 3 active parties); old_threshold = 3.
-        let params_3of4 = Parameters { threshold: 3, share_count: 4 };
+        let params_3of4 = Parameters {
+            threshold: 3,
+            share_count: 4,
+        };
         let sid3: [u8; 32] = rng::get_rng().random();
         let j3 = vec![
             PartyIndex::new(1).unwrap(),
@@ -903,7 +915,10 @@ mod tests {
     /// but has no old_share (not via `new_reshare_from_party`).
     #[test]
     fn test_resharing_phase1_aborts_when_in_j_but_no_share() {
-        let new_params = Parameters { threshold: 2, share_count: 2 };
+        let new_params = Parameters {
+            threshold: 2,
+            share_count: 2,
+        };
         let sid: [u8; 32] = rng::get_rng().random();
         let j = vec![PartyIndex::new(1).unwrap(), PartyIndex::new(2).unwrap()];
 
@@ -930,13 +945,19 @@ mod tests {
         };
 
         let result = session.phase1();
-        assert!(result.is_err(), "Should abort when in J but old_share is None");
+        assert!(
+            result.is_err(),
+            "Should abort when in J but old_share is None"
+        );
     }
 
     /// Phase 1 must abort when |J| < old_threshold.
     #[test]
     fn test_resharing_phase1_aborts_when_insufficient_participants() {
-        let new_params = Parameters { threshold: 2, share_count: 2 };
+        let new_params = Parameters {
+            threshold: 2,
+            share_count: 2,
+        };
         let sid: [u8; 32] = rng::get_rng().random();
         // Only 1 participant but threshold is 3.
         let j = vec![PartyIndex::new(1).unwrap()];
@@ -965,7 +986,10 @@ mod tests {
         let result = session.phase1();
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err().reason, AbortReason::WrongCounterpartyCount { .. }),
+            matches!(
+                result.unwrap_err().reason,
+                AbortReason::WrongCounterpartyCount { .. }
+            ),
             "Should abort with WrongCounterpartyCount"
         );
     }
