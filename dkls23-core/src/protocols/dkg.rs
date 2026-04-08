@@ -121,6 +121,19 @@ pub struct SessionData<C: DklsCurve> {
     /// It is zeroised immediately after Phase 1 has used it.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub old_share: Option<C::Scalar>,
+    /// This party's index in the OLD configuration.
+    ///
+    /// Required when an old party's index changes between configurations
+    /// (e.g. old index = 2, new index = 3).  Used in Phase 1 to find the
+    /// correct Lagrange coefficient λ_i within `old_participants`.
+    /// `None` for fresh DKG and for new-party resharing sessions.
+    pub old_party_index: Option<PartyIndex>,
+    /// Chain code from the old wallet configuration.
+    ///
+    /// Preserved verbatim through resharing so that all BIP-32 derived
+    /// addresses remain stable after the key ceremony.
+    /// `None` for fresh DKG sessions.
+    pub old_chain_code: Option<ChainCode>,
 }
 
 impl<C: DklsCurve> Zeroize for SessionData<C>
@@ -550,15 +563,19 @@ pub(crate) fn phase1<C: DklsCurve>(data: &SessionData<C>) -> Result<Vec<C::Scala
         ));
     }
 
+    // Fix A: Use `old_party_index` when set (old party with a different new index).
+    // e.g. old index = 2, new index = 3 → must look up old index 2 in `participants`.
+    let effective_index = data.old_party_index.unwrap_or(data.party_index);
+
     // Compute the constant term a_{i,0}.
-    let constant_term = if participants.contains(&data.party_index) {
+    let constant_term = if participants.contains(&effective_index) {
         // This party belongs to J and must have an old share.
         // Falling back to zero would silently corrupt the reconstructed secret —
         // we abort instead.
         let s_i = data.old_share.ok_or_else(|| {
             Abort::recoverable(data.party_index, AbortReason::TrivialKeyShare)
         })?;
-        let lambda = calculate_lagrange_coefficient::<C>(data.party_index, participants)?;
+        let lambda = calculate_lagrange_coefficient::<C>(effective_index, participants)?;
         lambda * s_i
     } else {
         // New or non-J party: a_{i,0} MUST be zero to preserve the group secret.
@@ -1284,6 +1301,8 @@ mod tests {
                 old_participants: None,
                 old_pk: None,
                 old_share: None,
+                old_party_index: None,
+                old_chain_code: None,
             });
         }
 
@@ -1812,6 +1831,8 @@ mod tests {
                 old_participants: None,
                 old_pk: None,
                 old_share: None,
+                old_party_index: None,
+                old_chain_code: None,
             });
         }
 

@@ -4,6 +4,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 use crate::curve::DklsCurve;
+use crate::protocols::derivation::ChainCode;
 use crate::protocols::dkg::{
     self, BroadcastDerivationPhase2to4, BroadcastDerivationPhase3to4, KeepInitMulPhase3to4,
     KeepInitZeroSharePhase2to3, KeepInitZeroSharePhase3to4, ProofCommitment, SessionData,
@@ -36,6 +37,8 @@ impl<C: DklsCurve> DkgSession<C> {
                 old_participants: None,
                 old_pk: None,
                 old_share: None,
+                old_party_index: None,
+                old_chain_code: None,
             },
             poly_point: None,
             proof_commitment: None,
@@ -76,6 +79,11 @@ impl<C: DklsCurve> DkgSession<C> {
                 old_pk: Some(old_party.pk),
                 // Copy the old share — it will be zeroized immediately after Phase 1 uses it.
                 old_share: Some(old_party.poly_point),
+                // Fix A: Store the OLD party index so phase1 can find it in old_participants,
+                // even when old_index ≠ new_index (e.g. P2 at old idx=2 reassigned to new idx=3).
+                old_party_index: Some(old_party.party_index),
+                // Fix B: Preserve the chain code so BIP-32 derived addresses stay stable.
+                old_chain_code: Some(old_party.derivation_data.chain_code),
             },
             poly_point: None,
             proof_commitment: None,
@@ -96,10 +104,15 @@ impl<C: DklsCurve> DkgSession<C> {
     /// * `old_pk` — the existing group public key, obtained from a trusted source
     ///   (e.g. a signed [`PublicKeyPackage`]).  It is kept until Phase 4 to verify
     ///   `new_pk == old_pk`.
+    /// * `old_chain_code` — the existing group chain code (public BIP-32 value, available
+    ///   from any xpub or from existing parties).  It **must** match the chain code held by
+    ///   the old parties so that after resharing every party — old and new alike — derives
+    ///   the same child keys and produces consistent multiplication session IDs during signing.
     /// * `new_parameters`, `new_party_index`, `session_id` — same as [`new`].
     #[must_use]
     pub fn new_reshare_as_new_party(
         old_pk: C::AffinePoint,
+        old_chain_code: ChainCode,
         new_parameters: Parameters,
         new_party_index: PartyIndex,
         session_id: Vec<u8>,
@@ -114,6 +127,12 @@ impl<C: DklsCurve> DkgSession<C> {
                 old_participants: None, // Not in J → a_{i,0} = 0 automatically.
                 old_pk: Some(old_pk),
                 old_share: None,
+                old_party_index: None,
+                // Supply the old chain code so that after Phase 4 this new party's
+                // derivation_data.chain_code equals that of the old parties.
+                // Without this, multiplication session IDs diverge between old and new
+                // parties and signing fails.
+                old_chain_code: Some(old_chain_code),
             },
             poly_point: None,
             proof_commitment: None,
@@ -261,7 +280,7 @@ impl<C: DklsCurve> DkgSession<C> {
             )
         })?;
 
-        let (new_party, pkg) = dkg::phase4::<C>(
+        let (mut new_party, pkg) = dkg::phase4::<C>(
             &self.data,
             poly_point,
             proofs_commitments,
@@ -280,6 +299,14 @@ impl<C: DklsCurve> DkgSession<C> {
         // supplied a wrong a_{i,0}, the reconstructed key will differ and we
         // abort.  This mirrors how refresh_complete_phase4 checks == identity.
         if self.data.is_reshare {
+            // Fix B: Restore the old chain code so that all BIP-32 derived
+            // addresses remain stable after the key ceremony.  Without this,
+            // the DKG BIP-32 protocol would assign a freshly-randomised chain
+            // code to the new party set, breaking wallet address continuity.
+            if let Some(old_chain_code) = self.data.old_chain_code {
+                new_party.derivation_data.chain_code = old_chain_code;
+            }
+
             let old_pk = self.data.old_pk.ok_or_else(|| {
                 Abort::recoverable(self.data.party_index, AbortReason::TrivialPublicKey)
             })?;
@@ -603,7 +630,7 @@ mod tests {
 
     /// Helper: run a full DKG and return all parties.
     fn run_full_dkg(parameters: Parameters, session_id: &[u8]) -> Vec<Party<Secp256k1>> {
-        let mut sessions: Vec<DkgSession<Secp256k1>> = (0..parameters.share_count)
+        let sessions: Vec<DkgSession<Secp256k1>> = (0..parameters.share_count)
             .map(|i| {
                 DkgSession::new(
                     parameters.clone(),
@@ -737,6 +764,9 @@ mod tests {
         let sid0: [u8; 32] = rng::get_rng().random();
         let initial = run_full_dkg(params_2of2.clone(), &sid0);
         let pk = initial[0].pk; // the public key that must survive every resharing
+        // The chain code is the same for all parties after DKG (Fix B ensures it stays the same
+        // through resharing). We'll reuse it when constructing new-party sessions.
+        let chain_code = initial[0].derivation_data.chain_code;
         assert_eq!(initial[1].pk, pk);
 
         // ── Step 1: 2-of-2 → 2-of-2, remove P2, add P3 (xóa party) ─────────
@@ -759,6 +789,7 @@ mod tests {
             // P3: brand-new party, new index 2
             DkgSession::new_reshare_as_new_party(
                 pk,
+                chain_code,
                 params_2of3_tmp.clone(),
                 PartyIndex::new(2).unwrap(),
                 sid1.to_vec(),
@@ -804,6 +835,7 @@ mod tests {
             // P4: brand-new party, new index 3
             DkgSession::new_reshare_as_new_party(
                 pk,
+                chain_code,
                 params_3of3.clone(),
                 PartyIndex::new(3).unwrap(),
                 sid2.to_vec(),
@@ -852,6 +884,7 @@ mod tests {
             // P5: brand-new party, new index 4
             DkgSession::new_reshare_as_new_party(
                 pk,
+                chain_code,
                 params_3of4.clone(),
                 PartyIndex::new(4).unwrap(),
                 sid3.to_vec(),
@@ -885,6 +918,8 @@ mod tests {
                 old_participants: Some(j),
                 old_pk: None,
                 old_share: None, // ← deliberately missing
+                old_party_index: None,
+                old_chain_code: None,
             },
             poly_point: None,
             proof_commitment: None,
@@ -916,6 +951,8 @@ mod tests {
                 old_participants: Some(j),
                 old_pk: None,
                 old_share: None,
+                old_party_index: None,
+                old_chain_code: None,
             },
             poly_point: None,
             proof_commitment: None,

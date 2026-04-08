@@ -1,5 +1,5 @@
 // End-to-end examples that simulate party communication using PhaseOutput/PhaseInput
-// Three tests: DKG, Distributed Signing (DSG), Refresh
+// Four tests: DKG, Distributed Signing (DSG), Refresh, Resharing
 // These tests build on the crate's public API and exercise frame encoding/decoding
 // via `protocols::messages::{PhaseOutput, PhaseInput}` so they simulate how
 // messages would be broadcast / sent P2P in the real network.
@@ -23,11 +23,227 @@ use dkls23_core::protocols::signing::TransmitPhase1to2;
 use dkls23_core::protocols::signing::TransmitPhase2to3;
 use dkls23_core::protocols::signing::Broadcast3to4;
 use dkls23_core::protocols::signing::SignData;
+use dkls23_core::protocols::signing::verify_ecdsa_signature;
 
 use dkls23_core::utilities::rng;
 use rand::RngExt;
 
 const SESSION_ID_LEN: usize = 32;
+
+// ── Resharing helpers ─────────────────────────────────────────────────────────
+
+/// Run all 4 DkgSession phases and return the resulting [`Party`] vector.
+///
+/// Handles all message routing internally (transpose, p2p filter).
+fn run_reshare_sessions(
+    mut sessions: Vec<DkgSession<Secp256k1>>,
+) -> Vec<dkls23_core::protocols::Party<Secp256k1>> {
+    let n = sessions.len();
+
+    // Phase 1: polynomial fragments.
+    let mut frags: Vec<Vec<k256::Scalar>> = Vec::with_capacity(n);
+    for s in sessions.iter_mut() {
+        frags.push(s.phase1().unwrap());
+    }
+    // Transpose: poly_frags[j] = fragments destined for party j.
+    let mut poly_frags = vec![Vec::<k256::Scalar>::with_capacity(n); n];
+    for row in frags {
+        for j in 0..n {
+            poly_frags[j].push(row[j]);
+        }
+    }
+
+    // Phase 2.
+    let mut proofs: Vec<ProofCommitment<Secp256k1>> = Vec::with_capacity(n);
+    let mut zt2: Vec<Vec<TransmitInitZeroSharePhase2to4>> = Vec::with_capacity(n);
+    let mut bip2: BTreeMap<PartyIndex, BroadcastDerivationPhase2to4> = BTreeMap::new();
+    let mut party_indices: Vec<PartyIndex> = Vec::with_capacity(n);
+
+    for (i, s) in sessions.iter_mut().enumerate() {
+        let (pc, zt, bb) = s.phase2(&poly_frags[i]).unwrap();
+        party_indices.push(bb.sender_index);
+        proofs.push(pc);
+        zt2.push(zt);
+        bip2.insert(bb.sender_index, bb);
+    }
+
+    // Route phase-2 p2p.
+    let mut zr2: Vec<Vec<TransmitInitZeroSharePhase2to4>> = Vec::with_capacity(n);
+    for pi in &party_indices {
+        zr2.push(
+            zt2.iter()
+                .flat_map(|v| v.iter())
+                .filter(|m| &m.parties.receiver == pi)
+                .cloned()
+                .collect(),
+        );
+    }
+
+    // Phase 3.
+    let mut zt3: Vec<Vec<TransmitInitZeroSharePhase3to4>> = Vec::with_capacity(n);
+    let mut mt3: Vec<Vec<TransmitInitMulPhase3to4<Secp256k1>>> = Vec::with_capacity(n);
+    let mut bip3: BTreeMap<PartyIndex, BroadcastDerivationPhase3to4> = BTreeMap::new();
+
+    for (_, s) in sessions.iter_mut().enumerate() {
+        let (zt, mt, bb) = s.phase3().unwrap();
+        zt3.push(zt);
+        mt3.push(mt);
+        bip3.insert(bb.sender_index, bb);
+    }
+
+    // Route phase-3 p2p.
+    let mut zr3: Vec<Vec<TransmitInitZeroSharePhase3to4>> = Vec::with_capacity(n);
+    let mut mr3: Vec<Vec<TransmitInitMulPhase3to4<Secp256k1>>> = Vec::with_capacity(n);
+    for pi in &party_indices {
+        zr3.push(
+            zt3.iter()
+                .flat_map(|v| v.iter())
+                .filter(|m| &m.parties.receiver == pi)
+                .cloned()
+                .collect(),
+        );
+        mr3.push(
+            mt3.iter()
+                .flat_map(|v| v.iter())
+                .filter(|m| &m.parties.receiver == pi)
+                .cloned()
+                .collect(),
+        );
+    }
+
+    // Phase 4.
+    sessions
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let (party, _) = s
+                .phase4(&proofs, &zr2[i], &zr3[i], &mr3[i], &bip2, &bip3, |_| {
+                    String::new()
+                })
+                .unwrap_or_else(|abort| {
+                    panic!("Party phase4 aborted: {:?}", abort.description())
+                });
+            party
+        })
+        .collect()
+}
+
+/// Sign `message_hash` using the given `executing` party-index subset and verify the result.
+///
+/// Panics if any phase fails or if the final ECDSA signature does not verify.
+fn sign_and_verify_reshare(
+    parties: &[dkls23_core::protocols::Party<Secp256k1>],
+    executing: &[u8],
+    message_hash: dkls23_core::utilities::hashes::HashOutput,
+) {
+    use dkls23_core::SignSession;
+
+    let sign_id = rng::get_rng().random::<[u8; 32]>();
+
+    // Phase 1 — create sessions.
+    let mut sessions: BTreeMap<u8, SignSession<'_, Secp256k1>> = BTreeMap::new();
+    let mut tx1: BTreeMap<u8, Vec<TransmitPhase1to2>> = BTreeMap::new();
+
+    for &i in executing {
+        let counterparties: Vec<PartyIndex> = executing
+            .iter()
+            .filter(|&&j| j != i)
+            .map(|&j| PartyIndex::new(j).unwrap())
+            .collect();
+        let data = SignData {
+            sign_id: sign_id.to_vec(),
+            counterparties,
+            message_hash,
+        };
+        let party = parties
+            .iter()
+            .find(|p| p.party_index.as_u8() == i)
+            .unwrap_or_else(|| panic!("Party {} not found in slice", i));
+        let (sess, transmit) = SignSession::new(party, data).unwrap_or_else(|abort| {
+            panic!("SignSession::new failed for party {}: {:?}", i, abort.description())
+        });
+        sessions.insert(i, sess);
+        tx1.insert(i, transmit);
+    }
+
+    // Route phase-1 messages.
+    let mut rx1: BTreeMap<u8, Vec<TransmitPhase1to2>> = BTreeMap::new();
+    for &i in executing {
+        let pi = PartyIndex::new(i).unwrap();
+        rx1.insert(
+            i,
+            tx1.values()
+                .flatten()
+                .filter(|m| m.parties.receiver == pi)
+                .cloned()
+                .collect(),
+        );
+    }
+
+    // Phase 2.
+    let mut tx2: BTreeMap<u8, Vec<TransmitPhase2to3<Secp256k1>>> = BTreeMap::new();
+    for &i in executing {
+        let transmit = sessions
+            .get_mut(&i)
+            .unwrap()
+            .phase2(rx1.get(&i).unwrap())
+            .unwrap_or_else(|abort| {
+                panic!("Phase2 aborted for party {}: {:?}", i, abort.description())
+            });
+        tx2.insert(i, transmit);
+    }
+
+    // Route phase-2 messages.
+    let mut rx2: BTreeMap<u8, Vec<TransmitPhase2to3<Secp256k1>>> = BTreeMap::new();
+    for &i in executing {
+        let pi = PartyIndex::new(i).unwrap();
+        rx2.insert(
+            i,
+            tx2.values()
+                .flatten()
+                .filter(|m| m.parties.receiver == pi)
+                .cloned()
+                .collect(),
+        );
+    }
+
+    // Phase 3.
+    let mut broadcasts: Vec<Broadcast3to4<Secp256k1>> = Vec::with_capacity(executing.len());
+    for &i in executing {
+        let bc = sessions
+            .get_mut(&i)
+            .unwrap()
+            .phase3(rx2.get(&i).unwrap())
+            .unwrap_or_else(|abort| {
+                panic!("Phase3 aborted for party {}: {:?}", i, abort.description())
+            });
+        broadcasts.push(bc);
+    }
+
+    // Phase 4.
+    let first = executing[0];
+    let session = sessions.remove(&first).unwrap();
+    let sig = session.phase4(&broadcasts, true).unwrap_or_else(|abort| {
+        panic!("Phase4 aborted for party {}: {:?}", first, abort.description())
+    });
+
+    // Verify.
+    assert_ne!(sig.r, [0u8; 32], "signature r should be non-zero");
+    assert_ne!(sig.s, [0u8; 32], "signature s should be non-zero");
+
+    let pk = parties
+        .iter()
+        .find(|p| p.party_index.as_u8() == first)
+        .unwrap()
+        .pk;
+    let r_hex = hex::encode(sig.r);
+    let s_hex = hex::encode(sig.s);
+    assert!(
+        verify_ecdsa_signature::<Secp256k1>(&message_hash, &pk, &r_hex, &s_hex),
+        "ECDSA signature verification failed for executing parties {:?}",
+        executing
+    );
+}
 
 fn assemble_input_for_receiver(outputs: &BTreeMap<u8, PhaseOutput>, receiver: u8) -> PhaseInput {
     let mut broadcasts: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
@@ -428,4 +644,164 @@ fn e2e_refresh_using_phaseio() {
 
     // basic assertion: we obtained refreshed parties without panics
     assert_eq!(refreshed_parties.len(), n);
+}
+
+/// End-to-end resharing test with signing at each step.
+///
+/// Scenario:
+/// ```text
+/// Step 0 : DKG   2-of-2  {P1@1, P2@2}
+///          → sign message 1 (both parties)
+///
+/// Step 1 : Reshare 2-of-2 → 2-of-3  add P3 at index 3
+///          J = {P1@1, P2@2}; new set = {P1@1, P2@2, P3@3}
+///          → sign message 2 with every 2-party combination
+///
+/// Step 2 : Reshare 2-of-3 → 2-of-3  replace P1 with P_new
+///          J = {P2@2, P3@3}; new set = {P_new@1, P2@2, P3@3}
+///          → sign message 3 with every 2-party combination
+/// ```
+///
+/// At every step the group public key and chain code must remain identical.
+#[test]
+fn e2e_resharing_with_signing() {
+    // ── Step 0: initial 2-of-2 DKG ──────────────────────────────────────────
+    let params_2of2 = Parameters { threshold: 2, share_count: 2 };
+    let sid0: [u8; SESSION_ID_LEN] = rng::get_rng().random();
+
+    let sessions_0: Vec<DkgSession<Secp256k1>> = (0..2_u8)
+        .map(|i| {
+            DkgSession::new(
+                params_2of2.clone(),
+                PartyIndex::new(i + 1).unwrap(),
+                sid0.to_vec(),
+            )
+        })
+        .collect();
+    let parties_0 = run_reshare_sessions(sessions_0);
+
+    let group_pk = parties_0[0].pk;
+    let chain_code = parties_0[0].derivation_data.chain_code;
+    assert_eq!(parties_0[1].pk, group_pk, "DKG: both parties must share the same pk");
+    assert_eq!(
+        parties_0[1].derivation_data.chain_code,
+        chain_code,
+        "DKG: both parties must share the same chain_code"
+    );
+
+    // Sign message 1 with the original 2-of-2 configuration.
+    let msg1 =
+        dkls23_core::utilities::hashes::tagged_hash(b"e2e-reshare", &[b"step0-message"]);
+    sign_and_verify_reshare(&parties_0, &[1, 2], msg1);
+
+    // ── Step 1: 2-of-2 → 2-of-3 (add P3) ───────────────────────────────────
+    // J = {P1@1, P2@2}; P3 is brand-new (not in J).
+    let params_2of3 = Parameters { threshold: 2, share_count: 3 };
+    let sid1: [u8; SESSION_ID_LEN] = rng::get_rng().random();
+    let j1 = vec![PartyIndex::new(1).unwrap(), PartyIndex::new(2).unwrap()];
+
+    let sessions_1: Vec<DkgSession<Secp256k1>> = vec![
+        // P1 stays at index 1.
+        DkgSession::new_reshare_from_party(
+            &parties_0[0],
+            j1.clone(),
+            params_2of3.clone(),
+            PartyIndex::new(1).unwrap(),
+            sid1.to_vec(),
+        ),
+        // P2 stays at index 2.
+        DkgSession::new_reshare_from_party(
+            &parties_0[1],
+            j1.clone(),
+            params_2of3.clone(),
+            PartyIndex::new(2).unwrap(),
+            sid1.to_vec(),
+        ),
+        // P3: brand-new device, receives index 3.
+        DkgSession::new_reshare_as_new_party(
+            group_pk,
+            chain_code,
+            params_2of3.clone(),
+            PartyIndex::new(3).unwrap(),
+            sid1.to_vec(),
+        ),
+    ];
+    let parties_1 = run_reshare_sessions(sessions_1);
+
+    // Verify pk and chain_code are preserved across all 3 parties.
+    for p in &parties_1 {
+        assert_eq!(p.pk, group_pk, "Step 1: pk must be preserved (party {})", p.party_index);
+        assert_eq!(
+            p.derivation_data.chain_code,
+            chain_code,
+            "Step 1: chain_code must be preserved (party {})",
+            p.party_index
+        );
+    }
+
+    // Sign message 2 using every valid 2-of-3 combination.
+    let msg2 =
+        dkls23_core::utilities::hashes::tagged_hash(b"e2e-reshare", &[b"step1-message"]);
+    sign_and_verify_reshare(&parties_1, &[1, 2], msg2);
+    sign_and_verify_reshare(&parties_1, &[1, 3], msg2); // P3 (new party) can sign
+    sign_and_verify_reshare(&parties_1, &[2, 3], msg2);
+
+    // ── Step 2: 2-of-3 → 2-of-3, replace P1 with P_new ─────────────────────
+    // P1 is removed from the active set.  P_new takes over index 1.
+    // J = {P2@2, P3@3} — exactly threshold = 2 parties, so both must participate.
+    // parties_1 indexing: [0] = P1@1 (removed), [1] = P2@2, [2] = P3@3.
+    let sid2: [u8; SESSION_ID_LEN] = rng::get_rng().random();
+    let j2 = vec![PartyIndex::new(2).unwrap(), PartyIndex::new(3).unwrap()];
+
+    let sessions_2: Vec<DkgSession<Secp256k1>> = vec![
+        // P_new: joins for the first time, gets index 1.
+        DkgSession::new_reshare_as_new_party(
+            group_pk,
+            chain_code,
+            params_2of3.clone(),
+            PartyIndex::new(1).unwrap(),
+            sid2.to_vec(),
+        ),
+        // P2 continues at index 2.
+        DkgSession::new_reshare_from_party(
+            &parties_1[1],
+            j2.clone(),
+            params_2of3.clone(),
+            PartyIndex::new(2).unwrap(),
+            sid2.to_vec(),
+        ),
+        // P3 continues at index 3.
+        DkgSession::new_reshare_from_party(
+            &parties_1[2],
+            j2.clone(),
+            params_2of3.clone(),
+            PartyIndex::new(3).unwrap(),
+            sid2.to_vec(),
+        ),
+    ];
+    let parties_2 = run_reshare_sessions(sessions_2);
+
+    // Verify pk and chain_code are preserved.
+    for p in &parties_2 {
+        assert_eq!(
+            p.pk,
+            group_pk,
+            "Step 2: pk must be preserved (party {})",
+            p.party_index
+        );
+        assert_eq!(
+            p.derivation_data.chain_code,
+            chain_code,
+            "Step 2: chain_code must be preserved (party {})",
+            p.party_index
+        );
+    }
+
+    // Sign message 3 using the new configuration {P_new@1, P2@2, P3@3}.
+    // Every 2-of-3 combination must work, including the brand-new P_new.
+    let msg3 =
+        dkls23_core::utilities::hashes::tagged_hash(b"e2e-reshare", &[b"step2-message"]);
+    sign_and_verify_reshare(&parties_2, &[1, 2], msg3); // P_new + P2
+    sign_and_verify_reshare(&parties_2, &[1, 3], msg3); // P_new + P3
+    sign_and_verify_reshare(&parties_2, &[2, 3], msg3); // P2 + P3 (P_new excluded)
 }

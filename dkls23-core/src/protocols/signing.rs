@@ -1447,6 +1447,8 @@ mod tests {
                 old_participants: None,
                 old_pk: None,
                 old_share: None,
+                old_party_index: None,
+                old_chain_code: None,
             });
         }
 
