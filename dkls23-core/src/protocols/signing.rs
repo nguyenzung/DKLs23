@@ -1435,19 +1435,27 @@ mod tests {
         let session_id = rng::get_rng().random::<[u8; crate::utilities::ID_LEN]>();
 
         // Each party prepares their data for this DKG.
-        let mut all_data: Vec<SessionData> = Vec::with_capacity(parameters.share_count as usize);
+        let mut all_data: Vec<SessionData<TestCurve>> =
+            Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
             all_data.push(SessionData {
                 parameters: parameters.clone(),
                 party_index: PartyIndex::new(i + 1).unwrap(),
                 session_id: session_id.to_vec(),
+                is_reshare: false,
+                old_threshold: None,
+                old_participants: None,
+                old_pk: None,
+                old_share: None,
+                old_party_index: None,
+                old_chain_code: None,
             });
         }
 
         // Phase 1
         let mut dkg_1: Vec<Vec<Scalar>> = Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
-            let out1 = phase1::<TestCurve>(&all_data[i as usize]);
+            let out1 = phase1::<TestCurve>(&all_data[i as usize]).unwrap();
 
             dkg_1.push(out1);
         }
